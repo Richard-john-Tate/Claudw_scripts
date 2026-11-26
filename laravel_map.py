@@ -358,6 +358,14 @@ class Cls(str):
     """A resolved class reference such as  App\\Models\\User::class."""
 
 
+class PathStr(str):
+    """A path we resolved from base_path()/database_path()/… ; remembers the original expression for display."""
+    src = ""
+
+
+DISPLAY_ROOT = {"path": None}
+
+
 class Node:
     """A PHP expression we could not (or chose not to) reduce to a plain Python value."""
     __slots__ = ("type", "name", "cls", "args", "kw", "base", "calls", "start", "end", "params", "text",
@@ -418,7 +426,12 @@ def fmt_val(v, depth=0):
         return "true" if v else "false"
     if v is None:
         return "null"
+    if isinstance(v, PathStr) and v.src:
+        return v.src
     if isinstance(v, str):
+        root = DISPLAY_ROOT["path"]
+        if root and root in v:
+            v = v.replace(root.rstrip("/") + "/", "").replace(root, ".")
         return "'" + v + "'"
     if isinstance(v, (int, float)):
         return str(v)
@@ -1132,7 +1145,9 @@ class PhpFile:
         bases = {"base_path": "", "app_path": "app", "resource_path": "resources", "database_path": "database",
                  "config_path": "config", "public_path": "public", "storage_path": "storage", "lang_path": "lang"}
         if name in bases and (not a or isinstance(a[0], str)):
-            return os.path.join(self.root, bases[name], a[0] if a else "")
+            ps = PathStr(os.path.join(self.root, bases[name], a[0] if a else ""))
+            ps.src = f"{node.name}(" + (repr(a[0]) if a else "") + ")"
+            return ps
         return None
 
     def _closure(self, i, e):
@@ -1755,6 +1770,7 @@ def classify(c, idx, pf):
 class Project:
     def __init__(self, root, static_only=False):
         self.root = os.path.abspath(root)
+        DISPLAY_ROOT["path"] = self.root
         self.composer = read_json(self.p("composer.json")) or {}
         self.lock = read_json(self.p("composer.lock")) or {}
         self.pkg = read_json(self.p("package.json")) or {}
@@ -5895,7 +5911,11 @@ JS_COMMON = r"""
   document.querySelectorAll('details').forEach(d => d.addEventListener('toggle', () => { if (d.open) render(Array.from(d.querySelectorAll('pre.mermaid'))); }));
   if (blocks.length) {
     if (window.mermaid) render(blocks);
-    else loadScript(__MERMAID__, () => render(blocks), () => document.body.classList.add('no-mermaid'));
+    else setTimeout(() => {
+      if (blocks.every(p => p.querySelector('svg') || p.hasAttribute('data-processed'))) return;  // already rendered by the host page
+      if (window.mermaid) render(blocks);
+      else loadScript(__MERMAID__, () => render(blocks), () => document.body.classList.add('no-mermaid'));
+    }, 250);
   }
 })();
 """
