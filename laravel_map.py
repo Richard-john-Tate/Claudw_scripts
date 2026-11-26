@@ -10,6 +10,8 @@ It reads the project's source (no app boot needed) and writes a set of linked HT
   changes.html    What changed: since your last run or --since <ref|date>, plus a catch-up checklist
   routes.html     Every route (web/api/admin/Filament/package), as a table, a URI tree and per controller
   http.html       Controllers, middleware, form requests, API resources and the request lifecycle
+  trace.html      Request traces: follow a route/command/job/component through every method it reaches,
+                  with the tables it reads and writes, jobs, events, mail and external calls ("who calls" too)
   models.html     Eloquent models, their relationships, casts, scopes, observers and policies
   database.html   Schema rebuilt from migrations (ER diagram), tables, migration timeline
   events.html     Events, listeners, jobs, mail, notifications, scheduled tasks, commands, channels
@@ -397,10 +399,10 @@ class Node:
 
 
 class Call:
-    __slots__ = ("name", "args", "kw", "line")
+    __slots__ = ("name", "args", "kw", "line", "prop")
 
-    def __init__(self, name, args, kw, line):
-        self.name, self.args, self.kw, self.line = name, args or [], kw or {}, line
+    def __init__(self, name, args, kw, line, prop=False):
+        self.name, self.args, self.kw, self.line, self.prop = name, args or [], kw or {}, line, prop
 
 
 class ParseError(Exception):
@@ -513,6 +515,7 @@ class MethodInfo:
         self.end_line = 0
         self.body = None
         self.doc = ""
+        self.rawdoc = ""
         self._scan = None
 
 
@@ -832,7 +835,8 @@ class PhpFile:
                         has = True
                     c.props[pname] = {"value": val, "has_default": has, "static": "static" in mods,
                                       "visibility": next((m for m in mods if m in ("public", "protected", "private")), "public"),
-                                      "type": "|".join(ptype), "line": line, "attrs": attrs}
+                                      "type": "|".join(ptype), "line": line, "attrs": attrs,
+                                      "doc": (T[start].doc if start is not None else T[k - 1].doc) or ""}
                     if k < e and T[k].v == ",":
                         k += 1
                         continue
@@ -850,6 +854,7 @@ class PhpFile:
         m = MethodInfo(T[k].v)
         k += 1
         m.line, m.doc, m.attrs = T[start].line, doc_summary(T[start].doc), attrs
+        m.rawdoc = T[start].doc or ""
         m.visibility = next((x for x in mods if x in ("public", "protected", "private")), "public")
         m.static, m.abstract = "static" in mods, "abstract" in mods
         if k < e and T[k].v == "(":
@@ -1011,7 +1016,7 @@ class PhpFile:
                         calls.append(Call(nx.v, args, kw, nx.line))
                         j = close + 1
                     else:
-                        calls.append(Call(nx.v, None, None, nx.line))
+                        calls.append(Call(nx.v, None, None, nx.line, prop=True))
                     continue
                 if nx.v == "{":
                     j = self.pair.get(j + 1, j + 1) + 1
@@ -2086,7 +2091,8 @@ class RouteParser:
             r["name"], r["middleware"] = out["name"], out["middleware"]
             return r
         if isinstance(action, Node) and action.type == "closure":
-            out.update(type="closure", label="Closure")
+            out.update(type="closure", label="Closure",
+                       _closure=(action.start, action.end, [(p["name"], p["types"]) for p in (action.params or [])]))
             return out
         if isinstance(action, list) and action:
             cls = self._qualify(action[0], ctx) if isinstance(action[0], str) else None
@@ -2129,6 +2135,8 @@ class RouteParser:
              "action": act.get("label"), "action_type": act.get("type"), "controller": act.get("controller"),
              "method": act.get("method"), "middleware": list(dict.fromkeys(mw)), "file": pf.rel, "line": line,
              "group": ctx.get("group") or "", "domain": ctx.get("domain"), "source": "static"}
+        if act.get("_closure"):
+            r["_closure"] = (pf.rel,) + tuple(act["_closure"])
         if extra:
             r.update(extra)
         self.routes.append(r)
@@ -5329,6 +5337,11 @@ def build_insights(data, proj):
     pend = [[m["name"]] for m in ((data.get("runtime") or {}).get("migrations") or []) if m["status"] == "Pending"]
     if pend:
         add("warn", "Database", f"{len(pend)} pending migration(s) on your local database", f"Run `{data['prefixes']['artisan']} migrate`.", pend, ["Migration"])
+    unused = (data.get("calls") or {}).get("unused") or []
+    if unused:
+        add("info", "Complexity", f"{len(unused)} public method(s) that nothing calls",
+            "No call to them was found in PHP, Blade or JS. Check before deleting: framework hooks, reflection and string-based calls are invisible here.",
+            unused, ["Method", "Role", "Defined at"])
     todos = []
     for sub in ("app", "routes", "config", "database", "resources", "tests", "bootstrap", "src", "Modules"):
         for ap, rel in walk(proj.root, sub, exts=(".php", ".js", ".ts", ".vue", ".jsx", ".tsx", ".css", ".scss")):
@@ -5479,6 +5492,13 @@ def analyze(root, light=False, artisan=None, want_db=False):
                 c["fk"] = fkmap.get(c["name"])
             data["schema"][tbl] = {**old, "columns": cols, "source": "database (artisan model:show)"}
     data["http"] = analyze_http(proj, data)
+    try:
+        data["calls"] = build_call_graph(proj, data)
+    except Exception as ex:  # noqa: BLE001 - the rest of the map is still useful without traces
+        import traceback
+        traceback.print_exc()
+        proj.notes.append(f"The call graph could not be built ({ex.__class__.__name__}: {ex}); request traces are unavailable.")
+        data["calls"] = None
     data["insights"] = build_insights(data, proj)
     data["meta"]["seconds"] = round((dt.datetime.now() - t0).total_seconds(), 2)
     return data, proj
@@ -6350,6 +6370,7 @@ PAGES = [
     ("changes.html", "What changed", "Orientation", "Commits, structural changes and a catch-up checklist since your last look."),
     ("routes.html", "Routes", "Application", "Every URL the app answers, who handles it and which middleware runs."),
     ("http.html", "HTTP layer", "Application", "Request lifecycle, middleware, controllers and what each action does."),
+    ("trace.html", "Request traces", "Application", "Follow a route, command or job through every method it reaches: tables, jobs, events, mail."),
     ("models.html", "Models", "Application", "Eloquent models, relationships, casts, scopes, observers and policies."),
     ("database.html", "Database", "Application", "Schema rebuilt from migrations: ER diagram, tables and history."),
     ("events.html", "Events & jobs", "Application", "Events, listeners, queued jobs, mail, notifications, schedule and commands."),
@@ -6387,6 +6408,10 @@ def page_shell(data, current, title, lede, body, counts, pages, with_graph=False
     scripts = f"<script>{JS_COMMON.replace('__MERMAID__', murls)}</script>"
     if with_graph:
         scripts += f"<script>{JS_GRAPH.replace('__D3__', durls)}</script>"
+    extra_css = ""
+    if current == "trace.html":
+        scripts += f"<script>{JS_TRACE}</script>"
+        extra_css = TRACE_CSS
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -6398,7 +6423,7 @@ def page_shell(data, current, title, lede, body, counts, pages, with_graph=False
 <script>{THEME_BOOT}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="{FONTS_URL}">
-<style>{CSS}</style>
+<style>{CSS}{extra_css}</style>
 </head>
 <body>
 <div class="shell">
@@ -7032,10 +7057,14 @@ def page_routes(data, h, pages):
     body = [callout("info", f"{len(routes)} routes from {e(src)}",
                     reg + ("Package routes marked <em>inferred</em> are guessed from installed packages; run with <code>--artisan auto</code> for the exact list." if any(r.get("source") == "package (inferred)" for r in routes) else ""))]
     rows = []
+    traced = (data.get("calls") or {}).get("routes") or {}
+    ridx = {id(r): i for i, r in enumerate(routes)}
     for r in sorted(routes, key=lambda r: (r["uri"], r["methods"])):
         src_cell = h.ref(r["file"], r["line"]) if r.get("file") else f'<span class="faint small">{e(r.get("source"))}</span>'
+        i = ridx[id(r)]
+        trace_link = f' <a class="small" href="trace.html#r-{i}" title="Follow this request">trace →</a>' if i in traced and "trace.html" in pages else ""
         rows.append([(methods_html(r["methods"]), "|".join(r["methods"])), f'<span class="mono">{e(r["uri"])}</span>' + (f' <span class="faint small">{e(r["domain"])}</span>' if r.get("domain") else ""),
-                     f'<span class="mono small">{e(r.get("name") or "")}</span>', action_html(r, roles),
+                     f'<span class="mono small">{e(r.get("name") or "")}</span>', action_html(r, roles) + trace_link,
                      f'<span class="mono small">{e(", ".join(r["middleware"]))}</span>', e(r.get("group") or ""), src_cell])
     quick = [(g, g) for g, _ in groups.most_common(6) if g != "—"] + [("POST", "POST"), ("DELETE", "DELETE"), ("auth", "auth")]
     body.append(section("all", "All routes", table(h, "t-routes", ["Method", "URI", "Name", "Handler", "Middleware", "Group", "Defined in"], rows, quick=quick,
@@ -7125,7 +7154,10 @@ def page_http(data, h, pages):
                 out += ": " + ", ".join(f"<code>{e(x)}</code>" for x in a["pages"])
             elif a["views"]:
                 out += ": " + ", ".join(f"<code>{e(x)}</code>" for x in a["views"])
-            rows.append([f'<span class="mono">{e(a["name"])}()</span>' + (f' <span class="faint small">{a["lines"]} lines</span>' if a["lines"] > 30 else ""),
+            ri = next((i for i, r in enumerate(data["routes"]) if r.get("controller") == c["fqn"] and (r.get("method") or "__invoke") == a["name"]
+                       and i in ((data.get("calls") or {}).get("routes") or {})), None)
+            tl = f' <a class="small" href="trace.html#r-{ri}">trace →</a>' if ri is not None and "trace.html" in pages else ""
+            rows.append([f'<span class="mono">{e(a["name"])}()</span>' + tl + (f' <span class="faint small">{a["lines"]} lines</span>' if a["lines"] > 30 else ""),
                          esc_list(a["routes"], mono=True, empty="no route"), "<br>".join(uses) or '<span class="faint">—</span>', out or '<span class="faint">—</span>'])
         summ = (f'<span class="mono">{e(c["name"])}</span> <span class="faint small">{len(c["actions"])} actions · {c["loc"]} lines</span>')
         inner = (f'<p class="small">{h.ref(c["file"], c["line"])}{" · " + e(c["doc"]) if c["doc"] else ""}</p>' +
@@ -7843,6 +7875,1263 @@ def page_insights(data, h, pages):
 
 
 # =====================================================================================================
+# 28. Method-level call graph ("what calls what") and request traces
+# =====================================================================================================
+
+CONF_RANK = {"exact": 0, "inferred": 1, "possible": 2}
+
+
+def worst(a, b):
+    return a if CONF_RANK.get(a, 2) >= CONF_RANK.get(b, 2) else b
+
+
+class Ty:
+    """What an expression evaluates to: candidate classes, how sure we are, and its shape."""
+    __slots__ = ("cls", "conf", "kind", "meta")
+
+    def __init__(self, cls, conf="exact", kind="obj", meta=None):
+        self.cls = tuple(dict.fromkeys(x for x in cls if x))
+        self.conf = conf
+        self.kind = kind      # obj | builder | rel | coll | table | ext | http | storage | cache | process | artisan | app | auth
+        self.meta = meta      # e.g. the pivot table of a belongsToMany relation
+
+
+EXT = Ty(("~ext",), "exact", "ext")   # "known, but not one of your classes": nothing to follow, nothing to report
+
+
+def merge_ty(ts):
+    ts = [t for t in ts if t is not None]
+    if not ts:
+        return None
+    objs = [t for t in ts if t.kind != "ext"]
+    if not objs:
+        return EXT
+    kind = objs[0].kind
+    same = [t for t in objs if t.kind == kind]
+    conf = "exact"
+    for t in same:
+        conf = worst(conf, t.conf)
+    return Ty([c for t in same for c in t.cls], conf, kind, same[0].meta)
+
+
+EL_BUILDER = {"query", "newQuery", "where", "orWhere", "whereIn", "whereNotIn", "whereNull", "whereNotNull", "whereHas", "orWhereHas",
+              "whereDoesntHave", "doesntHave", "has", "with", "withCount", "withSum", "withAvg", "withMax", "withMin", "withExists", "without",
+              "orderBy", "orderByDesc", "latest", "oldest", "select", "addSelect", "selectRaw", "whereRaw", "orWhereRaw", "join", "leftJoin",
+              "rightJoin", "groupBy", "having", "havingRaw", "limit", "take", "skip", "offset", "when", "unless", "withTrashed", "onlyTrashed",
+              "withoutTrashed", "distinct", "lockForUpdate", "sharedLock", "inRandomOrder", "whereBetween", "whereNotBetween", "whereDate",
+              "whereMonth", "whereDay", "whereYear", "whereTime", "whereColumn", "whereKey", "whereKeyNot", "whereBelongsTo", "whereRelation",
+              "orWhereRelation", "whereLike", "whereAny", "whereAll", "whereNone", "whereJsonContains", "whereNot", "orWhereNot", "whereExists",
+              "tap", "forPage", "reorder", "withGlobalScope", "withoutGlobalScope", "withoutGlobalScopes", "whereMorphedTo", "whereHasMorph",
+              "orderByRaw", "whereFullText", "withWhereHas", "toBase", "whereIntegerInRaw", "from"}
+EL_FIND = {"first", "firstOrFail", "find", "findOrFail", "findOrNew", "sole", "firstWhere", "findOr", "firstOr", "make", "newModelInstance", "firstOrNew"}
+EL_CREATE = {"create", "forceCreate", "firstOrCreate", "updateOrCreate", "createOrFirst", "createQuietly", "forceCreateQuietly"}
+EL_LIST = {"get", "all", "paginate", "simplePaginate", "cursorPaginate", "cursor", "lazy", "lazyById", "findMany", "chunk", "chunkById",
+           "each", "fromQuery", "hydrate", "eachById"}
+EL_SCALAR = {"count", "exists", "doesntExist", "sum", "avg", "average", "max", "min", "value", "pluck", "implode", "existsOr", "doesntExistOr"}
+EL_MASS_WRITE = {"update", "delete", "forceDelete", "increment", "decrement", "insert", "insertGetId", "insertOrIgnore", "upsert", "restore",
+                 "truncate", "updateOrInsert", "incrementEach", "decrementEach", "destroy", "touch"}
+INST_WRITE = {"save": "save", "saveQuietly": None, "update": "update", "updateQuietly": None, "delete": "delete", "deleteQuietly": None,
+              "forceDelete": "forceDelete", "restore": "restore", "increment": "update", "decrement": "update", "touch": "update",
+              "push": "save", "saveOrFail": "save", "deleteOrFail": "delete", "updateOrFail": "update"}
+INST_READ = {"load", "loadMissing", "loadCount", "loadSum", "loadMax", "loadMin", "loadAvg", "refresh", "fresh"}
+INST_SELF = {"replicate", "fill", "forceFill", "setAttribute", "setRelation", "unsetRelation", "makeHidden", "makeVisible", "append",
+             "withoutRelations", "setVisible", "setHidden", "mergeCasts"}
+REL_WRITE = {"create", "createMany", "save", "saveMany", "attach", "detach", "sync", "syncWithoutDetaching", "syncWithPivotValues",
+             "toggle", "associate", "dissociate", "updateExistingPivot", "firstOrCreate", "updateOrCreate", "forceCreate", "createQuietly",
+             "update", "delete", "upsert", "createManyQuietly"}
+REL_PIVOT = {"attach", "detach", "sync", "syncWithoutDetaching", "syncWithPivotValues", "toggle", "updateExistingPivot"}
+REL_RETURNS_MODEL = {"create", "save", "firstOrCreate", "updateOrCreate", "forceCreate", "createQuietly", "associate", "dissociate"}
+COLL_ELEM = {"first", "last", "find", "firstWhere", "sole", "pop", "shift", "random", "firstOrFail"}
+COLL_SAME = {"filter", "where", "whereIn", "whereNotIn", "sortBy", "sortByDesc", "values", "unique", "reject", "take", "skip", "reverse",
+             "merge", "each", "tap", "sort", "slice", "keyBy", "load", "loadMissing", "fresh", "except", "only", "diff", "intersect",
+             "whereNull", "whereNotNull", "concat", "push", "prepend", "collect", "toBase", "whereStrict", "shuffle", "forPage"}
+CLOSURE_ELEM = {"each", "map", "filter", "reject", "first", "last", "sortBy", "sortByDesc", "sum", "every", "contains", "groupBy", "keyBy",
+                "mapWithKeys", "flatMap", "transform", "partition", "search", "firstWhere", "sole", "doesntContain", "some", "mapToGroups",
+                "max", "min", "avg", "unique", "chunk", "chunkById", "lazy", "eachById", "sum", "countBy"}
+MODEL_EVENTS_FOR = {"create": ["creating", "created", "saving", "saved"], "save": ["saving", "saved", "creating", "created", "updating", "updated"],
+                    "update": ["updating", "updated", "saving", "saved"], "delete": ["deleting", "deleted"],
+                    "forceDelete": ["forceDeleting", "forceDeleted", "deleting", "deleted"], "restore": ["restoring", "restored"]}
+FACADE_KIND = {"Http": "http", "Storage": "storage", "Cache": "cache", "Redis": "cache", "Process": "process", "Artisan": "artisan"}
+EFFECT_VERBS = {"http": {"get", "post", "put", "patch", "delete", "head", "send", "pool"},
+                "storage": {"put", "putFile", "putFileAs", "get", "delete", "copy", "move", "exists", "download", "url", "temporaryUrl",
+                            "append", "prepend", "writeStream", "readStream", "makeDirectory", "deleteDirectory", "files", "allFiles", "json"},
+                "cache": {"get", "put", "remember", "rememberForever", "forget", "flush", "has", "add", "increment", "decrement", "forever",
+                          "pull", "many", "putMany", "set", "del", "hset", "hget", "publish", "flexible"},
+                "process": {"run", "start", "pipe", "pool", "concurrently"}, "artisan": {"call", "queue"}}
+AUTH_CALLS = {"authorize", "can", "cannot", "cant", "allows", "denies", "authorizeForUser", "inspect", "check", "any", "none"}
+EDGE_KINDS = ["call", "relation", "scope", "new", "action", "middleware", "validate", "authorize", "dispatch", "event", "listener",
+              "observer", "mail", "notify"]
+CONVENTIONAL_METHODS = {
+    "handle", "boot", "booted", "booting", "register", "rules", "authorize", "messages", "attributes", "prepareForValidation",
+    "passedValidation", "failedValidation", "withValidator", "after", "toArray", "toResponse", "with", "via", "toMail", "toDatabase",
+    "toBroadcast", "toSlack", "toVonage", "toSms", "build", "content", "envelope", "attachments", "headers", "render", "mount", "form",
+    "table", "infolist", "getPages", "getRelations", "getWidgets", "getHeaderActions", "getHeaderWidgets", "getFooterWidgets", "casts",
+    "definition", "run", "up", "down", "shouldQueue", "broadcastOn", "broadcastAs", "broadcastWith", "broadcastWhen", "middleware",
+    "failed", "retryUntil", "backoff", "uniqueId", "uniqueFor", "tags", "report", "context", "viaQueue", "viaConnection", "schedule",
+    "commands", "configure", "panel", "passes", "message", "validate", "get", "set", "serialize", "unserialize", "jsonSerialize",
+    "toJson", "terminate", "newFactory", "newCollection", "newEloquentBuilder", "resolveRouteBinding", "getRouteKeyName", "toSearchableArray",
+    "searchableAs", "shouldBeSearchable", "prunable", "pruning", "routeNotificationForMail", "routeNotificationForSlack", "canAccessPanel",
+    "getFilamentName", "getFilamentAvatarUrl", "label", "color", "icon", "getLabel", "getColor", "getIcon", "getDescription", "options",
+    "placeholder", "rendering", "rendered", "hydrate", "dehydrate", "updating", "updated", "exception", "getListeners", "getStats",
+    "getData", "getType", "getOptions", "getHeading", "getTableQuery", "getFormSchema", "getTableColumns", "getEloquentQuery",
+    "mutateFormDataBeforeCreate", "mutateFormDataBeforeSave", "afterCreate", "afterSave", "beforeCreate", "beforeSave", "getRedirectUrl",
+    "getNavigationBadge", "canCreate", "canEdit", "canDelete", "canView", "canViewAny", "shouldRegisterNavigation", "getGloballySearchableAttributes",
+}
+
+
+class CallGraph:
+    def __init__(self, proj, data):
+        self.proj, self.idx, self.roles = proj, proj.idx, proj.roles
+        self.models = data["models"]
+        self.rels = {f: {r["name"]: r for r in m["relations"]} for f, m in self.models.items()}
+        self.tables = {f: m["table"] for f, m in self.models.items()}
+        a = data["async"]
+        self.queued = {f for k in ("jobs", "listeners", "mail", "notifications") for f, d in a[k].items() if d.get("queued")}
+        self.listeners = defaultdict(list)
+        for w in a["wiring"]:
+            if w.get("listener"):
+                self.listeners[w["event"]].append((w["listener"], w.get("method") or "handle", w.get("source", "")))
+        self.observers = {f: m["observers"] for f, m in self.models.items()}
+        self.devents = {f: m["dispatches_events"] for f, m in self.models.items()}
+        self.policies = {f: m["policy"] for f, m in self.models.items() if m.get("policy")}
+        self.user_model = next((u for u in ("App\\Models\\User", "App\\User") if u in self.models), None)
+        self.impls = defaultdict(set)
+        for c in self.idx.by_fqn.values():
+            if c.kind == "class" and not c.abstract:
+                for x in set(self.idx.ancestors(c)) | self.idx.all_interfaces(c):
+                    if self.idx.get(x):
+                        self.impls[x].add(c.fqn)
+        self.bindings = self._bindings()
+        self.nodes, self.edges = {}, {}
+        self.effects = defaultdict(dict)
+        self.unresolved = defaultdict(dict)
+        self._mcache, self._pcache = {}, {}
+        self.roots = []
+        self.route_roots = {}
+
+    # ---- registry -----------------------------------------------------------------------------------
+    def node(self, nid, kind, label, file=None, line=None, role=None):
+        if nid not in self.nodes:
+            self.nodes[nid] = [nid, kind, label, file, line or 0, role or ""]
+        return nid
+
+    def mnode(self, owner, m):
+        c = self.idx.get(owner)
+        return self.node(f"{owner}::{m.name}", "method", f"{short(owner)}::{m.name}()", c.file.rel if c else None, m.line,
+                         self.roles.get(owner))
+
+    def cnode(self, fqn, kind):
+        c = self.idx.get(fqn)
+        return self.node(fqn, kind, short(fqn), c.file.rel if c else None, c.line if c else 0, self.roles.get(fqn) or kind)
+
+    def edge(self, f, t, k, conf, line, q=False):
+        key = (f, t, k)
+        old = self.edges.get(key)
+        if old is None or CONF_RANK[conf] < CONF_RANK[old[3]]:
+            self.edges[key] = [f, t, k, conf, line or 0, bool(q)]
+
+    def effect(self, nid, k, d, line):
+        if d:
+            self.effects[nid].setdefault((k, str(d)[:120]), line or 0)
+
+    # ---- class knowledge ----------------------------------------------------------------------------
+    def find_method(self, cls, name):
+        key = (cls, name)
+        if key in self._mcache:
+            return self._mcache[key]
+        res, seen, queue = None, set(), [cls]
+        while queue:
+            f = queue.pop(0)
+            if f in seen:
+                continue
+            seen.add(f)
+            c = self.idx.get(f)
+            if c is None:
+                continue
+            m = c.methods.get(name)
+            if m is not None:
+                res = (f, m)
+                break
+            queue.extend(c.traits)
+            if c.extends:
+                queue.append(c.extends)
+        self._mcache[key] = res
+        return res
+
+    def targets(self, cls, name):
+        """Methods a call may land on, following interfaces/abstracts to bound or implementing classes."""
+        fm = self.find_method(cls, name)
+        c = self.idx.get(cls)
+        if fm and fm[1].body:
+            return [(fm[0], fm[1], "exact")]
+        cands = self.bindings.get(cls) or (self.impls.get(cls) if c is not None and (c.kind == "interface" or c.abstract or fm) else None)
+        out = []
+        if cands:
+            conf = "inferred" if (cls in self.bindings or len(cands) == 1) else "possible"
+            for i in sorted(cands):
+                f2 = self.find_method(i, name)
+                if f2 and f2[1].body:
+                    out.append((f2[0], f2[1], conf))
+        if not out and fm:
+            out.append((fm[0], fm[1], "exact"))
+        return out
+
+    def _bindings(self):
+        out = defaultdict(set)
+        for prov in self.proj.classes_by_role("provider"):
+            pf = prov.file
+            for pname in ("bindings", "singletons"):
+                v = prop_value(self.proj, prov, pname)
+                if isinstance(v, dict):
+                    for k, x in v.items():
+                        if isinstance(x, str) and self.idx.get(str(x)):
+                            out[str(k)].add(str(x))
+            if not prov.body:
+                continue
+            T = pf.toks
+            for k in range(prov.body[0], min(prov.body[1], len(T) - 1)):
+                t = T[k]
+                if t.k == "name" and t.v in ("bind", "singleton", "scoped", "bindIf", "singletonIf", "scopedIf") and k > 0 \
+                        and T[k - 1].v in ("->", "::") and T[k + 1].v == "(":
+                    close = pf.pair.get(k + 1, k + 1)
+                    args, _ = pf.args(k + 2, close)
+                    if not args or not isinstance(args[0], str):
+                        continue
+                    abstract = str(args[0])
+                    if len(args) > 1 and isinstance(args[1], Cls):
+                        out[abstract].add(str(args[1]))
+                    elif len(args) > 1 and isinstance(args[1], Node) and args[1].type == "closure":
+                        for f, _ln in pf.scan(args[1].start, args[1].end, prov.fqn, prov.extends).news:
+                            if self.idx.get(f):
+                                out[abstract].add(f)
+                    elif len(args) == 1 and isinstance(args[0], Cls):
+                        out[abstract].add(abstract)
+        return out
+
+    def framework_parent(self, cls):
+        """True when the class inherits from something outside the project (properties may come from there)."""
+        c = self.idx.get(cls)
+        anc = self.idx.ancestors(c) if c else []
+        return bool(anc) and not self.idx.get(anc[-1])
+
+    def resolve_binding(self, cls, conf="exact"):
+        if self.bindings.get(cls):
+            return Ty(sorted(self.bindings[cls]), worst(conf, "inferred"))
+        return Ty((cls,), conf)
+
+    # ---- types ------------------------------------------------------------------------------------
+    def ty(self, types, self_cls, conf="exact"):
+        cls, coll = [], False
+        for t in types or []:
+            if not t:
+                continue
+            tl = t.lower()
+            if tl in ("self", "static", "$this"):
+                if self_cls:
+                    cls.append(self_cls)
+                continue
+            if tl in BUILTIN_TYPES or tl in ("null", "?"):
+                continue
+            if t.endswith("[]"):
+                coll, t = True, t[:-2]
+            if t.startswith("Illuminate\\") and short(t) in ("Collection", "LazyCollection", "LengthAwarePaginator", "Paginator", "CursorPaginator"):
+                coll = True
+                continue
+            cls.append(t)
+        if not cls:
+            return Ty(("~mixed",), conf, "coll") if coll else None
+        return Ty(cls, conf, "coll" if coll else "obj")
+
+    def ty_doc(self, s, pf, self_cls):
+        s = s.strip().lstrip("?")
+        m = re.match(r"^\\?[\w\\]+<(?:[^<>]*,\s*)?\\?([\w\\]+)>$", s)
+        if m:
+            return Ty([pf.type_name(m.group(1))], "inferred", "coll")
+        parts = [p for p in s.split("|") if p and p.lower() != "null"]
+        coll = any(p.endswith("[]") for p in parts)
+        t = self.ty([pf.type_name(p[:-2] if p.endswith("[]") else p) for p in parts if re.fullmatch(r"\\?[\w\\]+(\[\])?", p)], self_cls, "inferred")
+        if t is not None and coll:
+            t.kind = "coll"
+        return t
+
+    def ret_ty(self, owner, m, recv, conf):
+        r = (self.rels.get(owner) or {}).get(m.name)
+        if r:
+            if not r.get("related"):
+                return None
+            pivot = None
+            if r["type"] in ("belongsToMany", "morphToMany", "morphedByMany"):
+                a, b = sorted([snake(short(owner)), snake(short(r["related"]))])
+                pivot = r.get("pivot_table") or f"{a}_{b}"
+            return Ty((r["related"],), conf, "rel", pivot)
+        c = self.idx.get(owner)
+        if c is None:
+            return None
+        if m.returns:
+            t = self.ty(m.returns.split("|"), recv, conf)
+            if t is not None and t.kind != "coll":
+                return t
+        mm = re.search(r"@return\s+(\S+)", m.rawdoc or "")
+        if mm:
+            pf = c.file
+            old = (pf._cur, pf._cur_parent)
+            pf._cur, pf._cur_parent = owner, c.extends
+            try:
+                t = self.ty_doc(mm.group(1), pf, recv)
+            finally:
+                pf._cur, pf._cur_parent = old
+            if t is not None:
+                t.conf = worst(t.conf, conf)
+                return t
+        if m.returns:
+            return EXT
+        return None
+
+    def prop_ty(self, cls, prop):
+        key = (cls, prop)
+        if key in self._pcache:
+            return self._pcache[key]
+        self._pcache[key] = None
+        res, queue, seen = None, [cls], set()
+        while queue and res is None:
+            f = queue.pop(0)
+            if f in seen:
+                continue
+            seen.add(f)
+            c = self.idx.get(f)
+            if c is None:
+                continue
+            p = c.props.get(prop)
+            if p:
+                if p.get("type"):
+                    res = self.ty(p["type"].split("|"), f)
+                if res is None and p.get("doc"):
+                    mm = re.search(r"@var\s+(\S+)", p["doc"])
+                    if mm:
+                        res = self.ty_doc(mm.group(1), c.file, f)
+            if res is None:
+                res = self.assigned_ty(c, prop)
+            queue.extend(c.traits)
+            if c.extends:
+                queue.append(c.extends)
+        self._pcache[key] = res
+        return res
+
+    def assigned_ty(self, c, prop):
+        pf, T = c.file, c.file.toks
+        for m in c.methods.values():
+            if not m.body:
+                continue
+            s, e = m.body
+            for k in range(s, min(e, len(T)) - 4):
+                if T[k].v != "$this" or T[k + 1].v != "->" or T[k + 2].v != prop or T[k + 3].v != "=":
+                    continue
+                nx = T[k + 4]
+                if nx.k == "var":
+                    p = next((p for p in m.params if p["name"] and "$" + p["name"] == nx.v), None)
+                    if p and p["types"]:
+                        t = self.ty(p["types"], c.fqn, "inferred")
+                        if t is not None:
+                            return t
+                elif nx.k == "name" and nx.v.lower() == "new" and T[k + 5].k == "name":
+                    return Ty((pf.resolve(T[k + 5].v),), "inferred")
+                elif nx.k == "name" and nx.v.lower() in ("app", "resolve") and k + 7 < len(T) and T[k + 5].v == "(" \
+                        and T[k + 6].k == "name" and T[k + 7].v == "::":
+                    return self.resolve_binding(pf.resolve(T[k + 6].v), "inferred")
+        return None
+
+    # ---- walking method bodies ----------------------------------------------------------------------
+    def walk(self, nid, pf, s, e, env, cls):
+        old = (pf._cur, pf._cur_parent)
+        c = self.idx.get(cls) if cls else None
+        pf._cur, pf._cur_parent = cls, (c.extends if c else None)
+        try:
+            self._walk(nid, pf, s, e, env, cls)
+        finally:
+            pf._cur, pf._cur_parent = old
+
+    @staticmethod
+    def _chain_start(T, k, n):
+        t = T[k]
+        nxt = T[k + 1] if k + 1 < n else None
+        if nxt is None:
+            return False
+        prev = T[k - 1] if k > 0 else None
+        pv = prev.v.lower() if prev is not None else ""
+        if t.k == "var":
+            return nxt.v in ("->", "?->") and pv not in ("->", "?->", "::")
+        if t.k != "name" or pv in ("->", "?->", "::", "new", "function", "fn", "const", "class", "use", "namespace", "instanceof",
+                                   "extends", "implements", "case"):
+            return False
+        low = t.v.lower()
+        if low == "new":
+            return nxt.k == "name"
+        if nxt.v == "::":
+            return True
+        if nxt.v == "(":
+            return low not in PHP_KEYWORDS
+        return False
+
+    def _walk(self, nid, pf, s, e, env, cls):
+        T = pf.toks
+        n = min(e, len(T))
+        k = s
+        errs = (ParseError, IndexError, KeyError, TypeError, AttributeError, RecursionError, ValueError)
+        while k < n:
+            t = T[k]
+            if t.doc and "@var" in t.doc:
+                for m in re.finditer(r"@var\s+(\S+)\s+(\$\w+)", t.doc):
+                    ty = self.ty_doc(m.group(1), pf, cls)
+                    if ty is not None:
+                        env[m.group(2)] = ty
+            nxt = T[k + 1] if k + 1 < n else None
+            if t.k == "name" and nxt is not None and nxt.k == "var" and t.v.lower() not in PHP_KEYWORDS and t.v.lower() not in BUILTIN_TYPES:
+                ty = self.ty([pf.type_name(t.v)], cls)
+                if ty is not None:
+                    env[nxt.v] = ty
+                k += 1
+                continue
+            if t.k == "var" and nxt is not None and nxt.k == "op" and nxt.v in ("=", "??="):
+                ty = None
+                try:
+                    val, j = pf._postfix(k + 2, n)
+                    if j >= n or T[j].v in (";", ")", ",", "]"):
+                        ty = self.expr_ty(nid, pf, val, env, cls, False)
+                except errs:
+                    pass
+                if ty is not None:
+                    env[t.v] = ty
+                elif nxt.v == "=":
+                    env.pop(t.v, None)
+                k += 2
+                continue
+            if t.k == "name" and t.v.lower() == "foreach" and nxt is not None and nxt.v == "(":
+                close = pf.pair.get(k + 1, k + 1)
+                asi = next((j for j in range(k + 2, close) if T[j].k == "name" and T[j].v.lower() == "as"), None)
+                if asi is not None:
+                    ty = None
+                    try:
+                        val, _ = pf._postfix(k + 2, asi)
+                        ty = self.expr_ty(nid, pf, val, env, cls, False)
+                    except errs:
+                        pass
+                    vs = [T[j].v for j in range(asi + 1, close) if T[j].k == "var"]
+                    if ty is not None and ty.kind in ("coll", "rel", "builder") and vs:
+                        env[vs[-1]] = Ty(ty.cls, worst(ty.conf, "inferred"), "obj")
+                k += 2
+                continue
+            if self._chain_start(T, k, n):
+                try:
+                    val, _ = pf._postfix(k, n)
+                    self.expr_ty(nid, pf, val, env, cls, True)
+                except errs:
+                    pass
+            k += 1
+
+    @staticmethod
+    def _label(b):
+        if isinstance(b, Node):
+            if b.type == "var":
+                return b.name
+            if b.type == "static":
+                return f"{short(b.cls)}::{b.name}()"
+            if b.type == "call":
+                return f"{b.name}()"
+            if b.type == "new":
+                return f"new {short(b.cls or '')}"
+        return None
+
+    def expr_ty(self, nid, pf, val, env, cls, record):
+        if isinstance(val, Node) and val.type == "chain":
+            base, calls = val.base, val.calls
+        else:
+            base, calls = val, []
+        cur = self.base_ty(nid, pf, base, env, cls, record)
+        label = self._label(base)
+        for c in calls:
+            if cur is None:
+                if record and not c.prop and label and label.startswith("$") and label != "$this":
+                    self.unresolved[nid].setdefault(f"{label}->{c.name}()", c.line or 0)
+                return None
+            cur = self.call_ty(nid, pf, cur, c, env, cls, record)
+            label = (f"{label}->{c.name}" + ("" if c.prop else "()")) if label else None
+        return cur
+
+    def base_ty(self, nid, pf, b, env, cls, record):
+        if isinstance(b, Node):
+            if b.type == "var":
+                if b.name == "$this":
+                    return Ty((cls,), "exact") if cls else None
+                return env.get(b.name)
+            if b.type == "new":
+                if not b.cls or b.cls == "class@anonymous":
+                    return EXT
+                if record:
+                    self.on_new(nid, b.cls, b.line or 0)
+                return Ty((b.cls,), "exact")
+            if b.type == "static":
+                return self.on_static(nid, pf, b, env, cls, record)
+            if b.type == "call":
+                return self.on_func(nid, b, record)
+            if b.type == "closure":
+                return EXT
+            return None
+        if b is None or isinstance(b, (str, int, float, list, dict, bool)):
+            return EXT
+        return None
+
+    # ---- Laravel semantics --------------------------------------------------------------------------
+    def on_class_dispatch(self, nid, f, line, conf="exact"):
+        role = self.roles.get(f)
+        if role == "job":
+            hm = self.find_method(f, "handle") or self.find_method(f, "__invoke")
+            self.edge(nid, self.mnode(*hm) if hm else self.cnode(f, "job"), "dispatch", conf, line, f in self.queued)
+        elif role == "event":
+            self.edge(nid, self.cnode(f, "event"), "event", conf, line)
+        elif role == "mail":
+            self.edge(nid, self.cnode(f, "mail"), "mail", conf, line, f in self.queued)
+        elif role == "notification":
+            self.edge(nid, self.cnode(f, "notification"), "notify", conf, line, f in self.queued)
+
+    def on_new(self, nid, f, line):
+        if self.roles.get(f) in ("job", "event", "mail", "notification"):
+            self.on_class_dispatch(nid, f, line)
+            return
+        fm = self.find_method(f, "__construct")
+        if fm and fm[1].body and fm[1].body[1] - fm[1].body[0] > 1 and fm[0] == f:
+            self.edge(nid, self.mnode(*fm), "new", "exact", line)
+
+    def model_events(self, nid, model, op, line, conf):
+        evs = MODEL_EVENTS_FOR.get(op, [])
+        for o in self.observers.get(model, []):
+            for ev in evs:
+                fm = self.find_method(o, ev)
+                if fm:
+                    self.edge(nid, self.mnode(*fm), "observer", worst(conf, "inferred"), line)
+        for when, ev in (self.devents.get(model) or {}).items():
+            if when in evs and self.idx.get(ev):
+                self.on_class_dispatch(nid, ev, line, worst(conf, "inferred"))
+
+    def authorize(self, nid, args, env, line):
+        if not args or not isinstance(args[0], str):
+            return
+        ability, models = args[0], []
+        if len(args) > 1:
+            x = args[1]
+            if isinstance(x, Cls):
+                models = [str(x)]
+            elif isinstance(x, list):
+                models = class_strs(x)[:1]
+            elif isinstance(x, Node) and x.type == "var" and x.name in env:
+                models = list(env[x.name].cls)
+        for mdl in models:
+            pol = self.policies.get(mdl)
+            fm = self.find_method(pol, ability) if pol else None
+            if fm:
+                self.edge(nid, self.mnode(*fm), "authorize", "inferred", line)
+
+    def eloquent(self, nid, model, name, line, record, conf):
+        tbl = self.tables.get(model, short(model))
+        if name in EL_BUILDER:
+            return Ty((model,), conf, "builder")
+        if name in EL_FIND:
+            if record and name not in ("make", "newModelInstance", "firstOrNew"):
+                self.effect(nid, "db-read", tbl, line)
+            return Ty((model,), conf, "obj")
+        if name in EL_CREATE:
+            if record:
+                self.effect(nid, "db-write", f"{tbl} ({name})", line)
+                self.model_events(nid, model, "create", line, conf)
+            return Ty((model,), conf, "obj")
+        if name in EL_LIST:
+            if record:
+                self.effect(nid, "db-read", tbl, line)
+            return Ty((model,), conf, "coll")
+        if name in EL_SCALAR:
+            if record:
+                self.effect(nid, "db-read", tbl, line)
+            return EXT
+        if name in EL_MASS_WRITE:
+            if record:
+                self.effect(nid, "db-write", f"{tbl} ({name})", line)
+                if name == "destroy":
+                    self.model_events(nid, model, "delete", line, conf)
+            return EXT
+        return Ty((model,), "inferred", "builder")
+
+    def on_func(self, nid, b, record):
+        name = b.name.split("\\")[-1].lower()
+        a = b.args or []
+        line = b.line or 0
+        if name in ("app", "resolve") and a:
+            cs = class_strs(a[0])
+            return self.resolve_binding(cs[0]) if cs else EXT
+        if name == "app":
+            return Ty(("~app",), "exact", "app")
+        if name == "auth":
+            return Ty(("~auth",), "exact", "auth")
+        if name == "request" and not a:
+            return Ty(("Illuminate\\Http\\Request",), "exact")
+        if record:
+            if name == "view" and a and isinstance(a[0], str):
+                self.effect(nid, "view", a[0], line)
+            elif name == "inertia" and a and isinstance(a[0], str):
+                self.effect(nid, "page", a[0], line)
+            elif name in ("event", "dispatch", "dispatch_sync", "broadcast") and a and isinstance(a[0], Cls):
+                self.on_class_dispatch(nid, str(a[0]), line)
+        return EXT
+
+    def on_static(self, nid, pf, b, env, cls, record):
+        f, name, line = b.cls, b.name, b.line or 0
+        a = b.args or []
+        if f in self.models:
+            fm = self.find_method(f, name)
+            if fm and fm[1].body and (fm[1].static or name not in EL_BUILDER | EL_FIND | EL_CREATE | EL_LIST | EL_SCALAR | EL_MASS_WRITE):
+                if record:
+                    self.edge(nid, self.mnode(*fm), "call", "exact", line)
+                return self.ret_ty(fm[0], fm[1], f, "exact")
+            sc = self.find_method(f, "scope" + name[:1].upper() + name[1:])
+            if sc:
+                if record:
+                    self.edge(nid, self.mnode(*sc), "scope", "exact", line)
+                return Ty((f,), "exact", "builder")
+            return self.eloquent(nid, f, name, line, record, "exact")
+        if self.roles.get(f) in ("job", "event", "mail", "notification") and name in DISPATCH_STATICS | {"dispatchSync", "dispatchNow"}:
+            if record:
+                self.on_class_dispatch(nid, f, line)
+            return EXT
+        if self.idx.get(f):
+            outs = []
+            for owner, m, conf in self.targets(f, name):
+                if record:
+                    self.edge(nid, self.mnode(owner, m), "call", conf, line)
+                outs.append(self.ret_ty(owner, m, f, conf))
+            return merge_ty(outs) if outs else EXT
+        sf = short(f)
+        if sf in FACADE_KIND:
+            t = Ty((sf,), "exact", FACADE_KIND[sf])
+            if name in EFFECT_VERBS.get(t.kind, ()):
+                return self.call_ty(nid, pf, t, Call(name, a, b.kw, line), env, cls, record)
+            return t
+        if sf == "DB":
+            if name == "table" and a and isinstance(a[0], str):
+                return Ty((a[0],), "exact", "table")
+            if record and name in ("select", "insert", "update", "delete", "statement", "unprepared", "affectingStatement"):
+                self.effect(nid, "db-read" if name == "select" else "db-write", f"raw SQL ({name})", line)
+            return EXT
+        if record and sf == "Gate" and name in AUTH_CALLS:
+            self.authorize(nid, a, env, line)
+        if sf == "Auth" and name == "user":
+            return Ty((self.user_model,), "inferred") if self.user_model else EXT
+        if sf == "Auth" and name == "guard":
+            return Ty(("~auth",), "exact", "auth")
+        if sf in ("App", "Container") and name in ("make", "get", "makeWith") and a:
+            cs = class_strs(a[0])
+            return self.resolve_binding(cs[0]) if cs else EXT
+        if record and a and isinstance(a[0], str):
+            if sf == "Inertia" and name == "render":
+                self.effect(nid, "page", a[0], line)
+            elif sf == "View" and name == "make":
+                self.effect(nid, "view", a[0], line)
+        if record and sf in ("Event", "Bus", "Queue") and name in ("dispatch", "dispatchSync", "dispatchNow", "push", "later"):
+            for x in class_strs(a):
+                self.on_class_dispatch(nid, x, line)
+        return EXT
+
+    def call_ty(self, nid, pf, cur, c, env, cls, record):
+        name, line, k = c.name, c.line or 0, cur.kind
+        if k == "ext":
+            return EXT
+        if k in ("http", "storage", "cache", "process", "artisan"):
+            if name in EFFECT_VERBS.get(k, ()):
+                if record:
+                    arg = c.args[0] if c.args and isinstance(c.args[0], str) else ""
+                    self.effect(nid, k, (f"{name.upper()} {arg}" if k == "http" else f"{name} {arg}").strip(), line)
+                return EXT
+            return cur
+        if k == "app":
+            if name in ("make", "makeWith", "get", "build") and c.args:
+                cs = class_strs(c.args[0])
+                return self.resolve_binding(cs[0]) if cs else EXT
+            return EXT
+        if k == "auth":
+            if name == "user":
+                return Ty((self.user_model,), "inferred") if self.user_model else EXT
+            return cur if name == "guard" else EXT
+        if k == "table":
+            tbl = cur.cls[0]
+            if name in EL_BUILDER:
+                return cur
+            if record:
+                if name in EL_MASS_WRITE or name in ("insert", "updateOrInsert", "upsert", "insertGetId", "insertOrIgnore"):
+                    self.effect(nid, "db-write", f"{tbl} ({name})", line)
+                elif name in EL_FIND | EL_LIST | EL_SCALAR:
+                    self.effect(nid, "db-read", tbl, line)
+            return EXT
+        if k == "builder":
+            if c.args:
+                nested = name in ("whereHas", "orWhereHas", "whereDoesntHave", "orWhereDoesntHave", "with", "withCount", "withWhereHas",
+                                  "whereRelation", "load", "has")
+                for a in list(c.args) + list(c.kw.values()):
+                    for cl in ([a] if not isinstance(a, (list, dict)) else (a.values() if isinstance(a, dict) else a)):
+                        if isinstance(cl, Node) and cl.type == "closure" and cl.params and cl.params[0]["name"] and not cl.params[0]["types"]:
+                            env["$" + cl.params[0]["name"]] = EXT if nested else Ty(cur.cls, cur.conf, "builder")
+            outs = []
+            for mdl in cur.cls:
+                sc = self.find_method(mdl, "scope" + name[:1].upper() + name[1:]) if mdl in self.models else None
+                if sc:
+                    if record:
+                        self.edge(nid, self.mnode(*sc), "scope", cur.conf, line)
+                    outs.append(Ty((mdl,), cur.conf, "builder"))
+                elif mdl in self.models:
+                    outs.append(self.eloquent(nid, mdl, name, line, record, cur.conf))
+            return merge_ty(outs) or EXT
+        if k == "rel":
+            outs = []
+            for mdl in cur.cls:
+                if name in REL_WRITE:
+                    if record:
+                        tbl = cur.meta if (name in REL_PIVOT and cur.meta) else self.tables.get(mdl, short(mdl))
+                        self.effect(nid, "db-write", f"{tbl} ({name})", line)
+                        if name in ("create", "save", "createMany", "saveMany", "firstOrCreate", "updateOrCreate", "forceCreate"):
+                            self.model_events(nid, mdl, "create", line, cur.conf)
+                    outs.append(Ty((mdl,), cur.conf, "obj") if name in REL_RETURNS_MODEL else EXT)
+                else:
+                    outs.append(self.call_ty(nid, pf, Ty((mdl,), cur.conf, "builder"), c, env, cls, record))
+            return merge_ty(outs) or EXT
+        if k == "coll":
+            if c.args and name in CLOSURE_ELEM:
+                for a in c.args:
+                    if isinstance(a, Node) and a.type == "closure" and a.params and a.params[0]["name"] and not a.params[0]["types"]:
+                        env["$" + a.params[0]["name"]] = Ty(cur.cls, worst(cur.conf, "inferred"), "obj")
+            if name in COLL_ELEM:
+                return Ty(cur.cls, cur.conf, "obj")
+            if name in COLL_SAME:
+                return cur
+            return EXT
+        if c.prop:   # property access
+            outs = []
+            for x in cur.cls:
+                r = (self.rels.get(x) or {}).get(name)
+                if r and r.get("related"):
+                    outs.append(Ty((r["related"],), worst(cur.conf, "inferred"), "coll" if r["type"] in REL_MANY else "obj"))
+                    continue
+                t = self.prop_ty(x, name) if self.idx.get(x) else None
+                if t is not None:
+                    outs.append(Ty(t.cls, worst(cur.conf, t.conf), t.kind, t.meta))
+                elif not self.idx.get(x) or x in self.models or self.framework_parent(x):
+                    outs.append(EXT)
+            return merge_ty(outs)
+        if record and name in AUTH_CALLS and c.args and isinstance(c.args[0], str):
+            self.authorize(nid, c.args, env, line)
+        outs, hit = [], False
+        for x in cur.cls:
+            tg = self.targets(x, name) if self.idx.get(x) else []
+            if tg:
+                hit = True
+                for owner, m, conf in tg:
+                    cf = worst(cur.conf, conf)
+                    if record:
+                        self.edge(nid, self.mnode(owner, m), "relation" if name in (self.rels.get(owner) or {}) else "call", cf, line)
+                    outs.append(self.ret_ty(owner, m, x, cf))
+                continue
+            if x in self.models:
+                if name in INST_WRITE:
+                    hit = True
+                    if record:
+                        self.effect(nid, "db-write", f"{self.tables.get(x, short(x))} ({name})", line)
+                        if INST_WRITE[name]:
+                            self.model_events(nid, x, INST_WRITE[name], line, cur.conf)
+                    outs.append(EXT)
+                    continue
+                if name in INST_READ:
+                    hit = True
+                    if record:
+                        self.effect(nid, "db-read", self.tables.get(x, short(x)), line)
+                    outs.append(Ty((x,), cur.conf))
+                    continue
+                if name in ("newQuery", "query"):
+                    hit = True
+                    outs.append(Ty((x,), cur.conf, "builder"))
+                    continue
+                if name in INST_SELF:
+                    hit = True
+                    outs.append(Ty((x,), cur.conf))
+                    continue
+            if name == "user" and (x.endswith("Request") or self.roles.get(x) == "request") and self.user_model:
+                hit = True
+                outs.append(Ty((self.user_model,), "inferred"))
+        if outs:
+            return merge_ty(outs)
+        return None if hit else EXT
+
+    # ---- entry points ---------------------------------------------------------------------------------
+    def build(self, data):
+        skip = {"test", "migration", "factory", "seeder"}
+        for c in list(self.idx.by_fqn.values()):
+            if c.role in skip:
+                continue
+            for m in list(c.methods.values()):
+                if not m.body:
+                    continue
+                nid = self.mnode(c.fqn, m)
+                env = {}
+                for p in m.params:
+                    if p["name"] and p["types"]:
+                        t = self.ty(p["types"], c.fqn)
+                        if t is not None:
+                            env["$" + p["name"]] = t
+                self.walk(nid, c.file, m.body[0], m.body[1], env, c.fqn)
+        self.add_roots(data)
+        self.finalize(data)
+        return self
+
+    def add_roots(self, data):
+        mw = data["middleware"]
+        groups, aliases = mw.get("groups") or {}, mw.get("aliases") or {}
+        for i, r in enumerate(data["routes"]):
+            t, ctrl, meth, line = r.get("action_type"), r.get("controller"), r.get("method"), r.get("line")
+            label = f"{' '.join(m for m in r['methods'] if m != 'HEAD')} {r['uri']}"
+            rid = f"route:{i}"
+            if t in ("controller", "livewire", "filament") and ctrl and self.idx.get(ctrl):
+                self.node(rid, "route", label, r.get("file"), line, "request")
+                if t == "filament":
+                    c = self.idx.get(ctrl)
+                    res = prop_value(self.proj, c, "resource")
+                    anc = " ".join(self.idx.ancestors(c))
+                    if isinstance(res, str) and self.idx.get(str(res)):
+                        mname = "table" if ("ListRecords" in anc or "ManageRecords" in anc) else "infolist" if "ViewRecord" in anc else "form"
+                        fm = self.find_method(str(res), mname) or self.find_method(str(res), "form")
+                        if fm:
+                            self.edge(rid, self.mnode(*fm), "action", "inferred", line)
+                    names = [x for x in c.methods if x in ("mount", "getHeaderActions", "table", "form", "getHeaderWidgets")]
+                else:
+                    names = [meth or "__invoke"] if t == "controller" else ["mount", "render"]
+                for mn in names:
+                    fm = self.find_method(ctrl, mn)
+                    if not fm:
+                        continue
+                    self.edge(rid, self.mnode(*fm), "action", "exact", line)
+                    if t == "controller":
+                        for p in fm[1].params:
+                            for ty in p["types"]:
+                                if self.roles.get(ty) == "request":
+                                    for rm in ("authorize", "rules", "prepareForValidation", "after", "withValidator"):
+                                        f2 = self.find_method(ty, rm)
+                                        if f2 and f2[1].body:
+                                            self.edge(rid, self.mnode(*f2), "validate", "exact", line)
+            elif t == "closure" and r.get("_closure"):
+                rel, s, e, params = r["_closure"]
+                pf = self.proj.php.get(rel)
+                if pf is None:
+                    continue
+                self.node(rid, "route", label, r.get("file"), line, "request")
+                cid = self.node(f"closure:{i}", "closure", f"Closure ({rel}:{line})", rel, line, "controller")
+                env = {}
+                for pname, ptypes in params:
+                    t2 = self.ty(ptypes, None)
+                    if t2 is not None and pname:
+                        env["$" + pname] = t2
+                self.walk(cid, pf, s, e, env, None)
+                self.edge(rid, cid, "action", "exact", line)
+            elif t in ("view", "volt", "redirect"):
+                self.node(rid, "route", label, r.get("file"), line, "request")
+                self.effect(rid, {"view": "view", "volt": "volt", "redirect": "redirect"}[t], r.get("view") or r.get("volt") or r.get("target"), line)
+            else:
+                continue
+            for m in r["middleware"]:
+                alias = m.split(":")[0]
+                cands = list(groups.get(alias) or []) if alias in groups else [aliases.get(alias)] if alias in aliases else [alias] if "\\" in alias else []
+                for x in cands:
+                    if isinstance(x, str) and self.idx.get(x):
+                        fm = self.find_method(x, "handle")
+                        if fm and fm[1].body:
+                            self.edge(rid, self.mnode(*fm), "middleware", "exact", 0)
+                            continue
+                        mc = self.idx.get(x)
+                        for mm in mc.methods.values():
+                            if mm.body and mm.visibility == "public" and not mm.name.startswith("__"):
+                                self.edge(rid, self.mnode(x, mm), "middleware", "exact", 0)
+            self.route_roots[i] = rid
+            self.roots.append([rid, "Routes", label, r.get("action") or r.get("view") or "", i])
+        for cmd in data["console"]["commands"]:
+            fm = self.find_method(cmd["fqn"], "handle") or self.find_method(cmd["fqn"], "__invoke")
+            if fm:
+                rid = self.node(f"cmd:{cmd['fqn']}", "command", f"artisan {cmd['name']}", cmd["file"], cmd["line"], "command")
+                self.edge(rid, self.mnode(*fm), "action", "exact", 0)
+                self.roots.append([rid, "Artisan commands", f"artisan {cmd['name']}", short(cmd["fqn"]), None])
+        cmd_by_name = {c["name"]: c["fqn"] for c in data["console"]["commands"]}
+        jobs_by_short = {short(f): f for f in data["async"]["jobs"]}
+        for j, s in enumerate(data["console"]["schedule"]):
+            rid = self.node(f"sched:{j}", "schedule", f"{s['target']} ({s['frequency']})", s.get("file"), s.get("line"), "command")
+            if s["type"] == "job" and s["target"] in jobs_by_short:
+                self.on_class_dispatch(rid, jobs_by_short[s["target"]], s.get("line"))
+            elif s["type"] == "command" and s["target"] in cmd_by_name:
+                fm = self.find_method(cmd_by_name[s["target"]], "handle")
+                if fm:
+                    self.edge(rid, self.mnode(*fm), "action", "exact", s.get("line"))
+            self.roots.append([rid, "Scheduled tasks", s["target"], s["frequency"], None])
+        for comp in data["livewire"]["components"]:
+            if not comp.get("fqn") or not self.idx.get(comp["fqn"]):
+                continue
+            rid = self.node(f"lw:{comp['fqn']}", "livewire", f"<livewire:{comp['alias']}>", comp["file"], comp["line"], "livewire")
+            for mn in ["mount", "render"] + comp["actions"] + [x["method"] for x in comp["listens"]]:
+                fm = self.find_method(comp["fqn"], mn)
+                if fm:
+                    self.edge(rid, self.mnode(*fm), "action", "exact", 0)
+            self.roots.append([rid, "Livewire components", comp["alias"], short(comp["fqn"]), None])
+        for group, bucket in (("Queued jobs", "jobs"), ("Listeners", "listeners")):
+            for f in sorted(data["async"][bucket]):
+                fm = self.find_method(f, "handle") or self.find_method(f, "__invoke")
+                if fm:
+                    self.roots.append([self.mnode(*fm), group, short(f), "queued" if f in self.queued else "sync", None])
+
+    def finalize(self, data):
+        for nid, n in list(self.nodes.items()):
+            if n[1] == "event":
+                for l, meth, src in self.listeners.get(nid, []):
+                    fm = self.find_method(l, meth)
+                    if fm:
+                        self.edge(nid, self.mnode(*fm), "listener", "inferred" if "auto" in src or "type-hint" in src else "exact", 0, l in self.queued)
+            elif n[1] == "mail":
+                for v in data["async"]["mail"].get(nid, {}).get("views", []):
+                    self.effect(nid, "view", v, 0)
+            elif n[1] == "notification":
+                for ch in data["async"]["notifications"].get(nid, {}).get("channels", []):
+                    self.effect(nid, "channel", ch, 0)
+                for mn in ("toMail", "toDatabase", "toBroadcast", "toArray"):
+                    fm = self.find_method(nid, mn)
+                    if fm and fm[0] == nid:
+                        self.edge(nid, self.mnode(*fm), "call", "exact", 0)
+
+    def unused_methods(self, data):
+        incoming = {e[1] for e in self.edges.values()}
+        words = Counter()
+        for pf in self.proj.php.values():
+            for t in pf.toks:
+                if t.k == "name":
+                    words[t.v] += 1
+                elif t.k == "str" and len(t.v) < 200:
+                    for w in re.findall(r"[A-Za-z_]\w*", t.v):
+                        words[w] += 1
+        skip_roles = {"test", "migration", "factory", "seeder", "livewire", "filament", "policy", "observer", "listener", "job", "command",
+                      "middleware", "provider", "mail", "notification", "request", "resource", "component", "rule", "cast", "scope",
+                      "exception", "event", "controller", "interface", "enum"}
+        cands = []
+        for c in self.idx.by_fqn.values():
+            if c.role in skip_roles:
+                continue
+            rels = self.rels.get(c.fqn) or {}
+            for m in c.methods.values():
+                n = m.name
+                if m.visibility != "public" or n.startswith("__") or n in CONVENTIONAL_METHODS or n in rels or not m.body:
+                    continue
+                if n.startswith("scope") or re.fullmatch(r"(get|set)\w+Attribute", n) or (m.returns and short(m.returns) == "Attribute"):
+                    continue
+                if f"{c.fqn}::{n}" in incoming:
+                    continue
+                cands.append((c, m))
+        if cands:
+            names = {m.name for _, m in cands}
+            for ap, rel in walk(self.proj.root, "resources", exts=(".php", ".js", ".ts", ".vue", ".jsx", ".tsx")):
+                for w in re.findall(r"[A-Za-z_]\w*", read_text(ap)):
+                    if w in names:
+                        words[w] += 1
+        return [[f"{c.name}::{m.name}()", ROLE_INFO.get(c.role, {}).get("label", c.role), f"{c.file.rel}:{m.line}"]
+                for c, m in cands if words[m.name] <= 1]
+
+    def export(self):
+        used = set()
+        for e in self.edges.values():
+            used.add(e[0])
+            used.add(e[1])
+        used |= set(self.effects) | set(self.unresolved) | {r[0] for r in self.roots}
+        ids = [nid for nid in self.nodes if nid in used]
+        pos = {nid: i for i, nid in enumerate(ids)}
+        edges = [[pos[e[0]], pos[e[1]], EDGE_KINDS.index(e[2]), ["exact", "inferred", "possible"].index(e[3]), e[4], 1 if e[5] else 0]
+                 for e in self.edges.values() if e[0] in pos and e[1] in pos]
+        conf = Counter(e[3] for e in edges)
+        return {"n": [self.nodes[i] for i in ids], "e": edges, "K": EDGE_KINDS, "C": ["exact", "inferred", "possible"],
+                "x": {pos[n]: [[k, d, l] for (k, d), l in v.items()] for n, v in self.effects.items() if n in pos},
+                "u": {pos[n]: [[x, l] for x, l in v.items()] for n, v in self.unresolved.items() if n in pos},
+                "r": [[pos[r[0]], r[1], r[2], r[3], r[4]] for r in self.roots if r[0] in pos],
+                "routes": {i: pos[rid] for i, rid in self.route_roots.items() if rid in pos},
+                "pos": pos,
+                "stats": {"methods": sum(1 for i in ids if self.nodes[i][1] == "method"), "edges": len(edges),
+                          "exact": conf.get(0, 0), "inferred": conf.get(1, 0), "possible": conf.get(2, 0),
+                          "unresolved": sum(len(v) for v in self.unresolved.values())}}
+
+
+def build_call_graph(proj, data):
+    cg = CallGraph(proj, data).build(data)
+    out = cg.export()
+    out["unused"] = cg.unused_methods(data)
+    return out
+
+
+# ---------------------------------------------------------------------------------------------- trace
+
+TRACE_CSS = r"""
+.trace { display: grid; grid-template-columns: minmax(240px, 330px) minmax(0, 1fr); gap: 18px; align-items: start; }
+.trace-side { position: sticky; top: 16px; display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 8px; max-height: calc(100vh - 32px);
+              background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; min-width: 0; }
+.trace-tabs { display: flex; gap: 4px; }
+.tt { flex: 1; font: 500 var(--step--1)/1 var(--font-body); padding: 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface-2);
+      color: var(--muted); cursor: pointer; }
+.tt[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.trace-side input { font: inherit; font-size: var(--step--1); padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line-2);
+                    background: var(--surface); color: var(--fg); min-width: 0; }
+.trace-list { overflow-y: auto; min-height: 0; display: grid; gap: 10px; align-content: start; }
+.trace-list h4 { font: 600 .6875rem/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--faint); padding: 6px 6px 2px; }
+.trace-list ul { list-style: none; padding: 0; display: grid; gap: 1px; }
+.trace-list button { width: 100%; text-align: left; background: none; border: 0; padding: 6px 8px; border-radius: 6px; cursor: pointer; color: var(--fg);
+                     font: 500 .8125rem/1.35 var(--font-mono); display: grid; gap: 2px; overflow-wrap: anywhere; }
+.trace-list button span { font: 400 .75rem/1.3 var(--font-body); color: var(--faint); }
+.trace-list button:hover { background: var(--surface-2); }
+.trace-list button[aria-current="true"] { background: var(--accent-soft); color: var(--accent); }
+.trace-list .more { font-size: .75rem; color: var(--faint); padding: 4px 8px; }
+.trace-main { display: grid; gap: 14px; min-width: 0; }
+.trace-head { display: grid; gap: 4px; }
+.trace-head h2 { font: 600 var(--step-1)/1.3 var(--font-mono); overflow-wrap: anywhere; }
+.trace-sum { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 10px; }
+.trace-sum .card { padding: 12px 14px; gap: 6px; }
+.trace-sum h4 { font: 600 .6875rem/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+.trace-sum .chips { gap: 4px; }
+.entry-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.entry-list button, .lnkbtn { font: 500 .75rem/1.3 var(--font-mono); padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line);
+                              background: var(--surface); color: var(--accent); cursor: pointer; }
+ul.ttree, ul.ttree ul { list-style: none; margin: 0; padding-left: 0; }
+ul.ttree { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px; overflow-x: auto; }
+ul.ttree ul { padding-left: 16px; border-left: 1px dashed var(--line-2); margin-left: 10px; }
+.tn > summary, .tn.leaf { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; padding: 4px 6px; border-radius: 6px; list-style: none; }
+.tn > summary { cursor: pointer; }
+.tn > summary::-webkit-details-marker { display: none; }
+.tn > summary::before { content: "▸"; color: var(--faint); width: 10px; flex: none; }
+.tn[open] > summary::before { content: "▾"; }
+.tn.leaf { padding-left: 24px; }
+.tn > summary:hover { background: var(--surface-2); }
+.ek { font: 600 .6875rem/1.4 var(--font-mono); color: var(--faint); min-width: 4.5em; }
+.ek-dispatch, .ek-event, .ek-listener, .ek-mail, .ek-notify { color: var(--role-job); }
+.ek-middleware, .ek-validate, .ek-authorize { color: var(--role-middleware); }
+.ek-observer { color: var(--role-observer); }
+.nl { font: 500 .8125rem/1.4 var(--font-mono); display: inline-flex; gap: 6px; align-items: baseline; overflow-wrap: anywhere; color: var(--fg); }
+.nl::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--dot, var(--faint)); flex: none; align-self: center; }
+.fx { font: 500 .6875rem/1.4 var(--font-mono); padding: 0 6px; border-radius: 4px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); max-width: 100%; overflow-wrap: anywhere; }
+.fx-db-write { color: var(--warn); background: var(--warn-bg); border-color: transparent; }
+.fx-db-read { color: var(--info); background: var(--info-bg); border-color: transparent; }
+.fx-http { color: var(--crit); background: var(--crit-bg); border-color: transparent; }
+.tn .count { font: 500 .6875rem/1 var(--font-mono); color: var(--faint); }
+@media (max-width: 900px) { .trace { grid-template-columns: minmax(0, 1fr); } .trace-side { position: static; max-height: 48vh; } }
+"""
+
+JS_TRACE = r"""
+(function () {
+  const dataEl = document.getElementById('trace-data');
+  if (!dataEl) return;
+  const G = JSON.parse(dataEl.textContent);
+  const N = G.n, K = G.K, C = G.C, fx = G.x || {}, un = G.u || {};
+  const out = N.map(() => []), inn = N.map(() => []);
+  G.e.forEach(e => { out[e[0]].push(e); inn[e[1]].push(e); });
+  const ORDER = { middleware: 0, validate: 1, authorize: 2, action: 3 };
+  const rank = e => { const k = K[e[2]]; return k in ORDER ? ORDER[k] : 4; };
+  out.forEach(a => a.sort((x, y) => rank(x) - rank(y) || x[4] - y[4]));
+  const rootOf = new Map(); G.r.forEach((r, i) => { if (!rootOf.has(r[0])) rootOf.set(r[0], i); });
+  const KL = { call: 'calls', relation: 'relation', scope: 'scope', new: 'new', action: 'runs', middleware: 'middleware', validate: 'validates',
+    authorize: 'authorises', dispatch: 'dispatches', event: 'fires', listener: 'listener', observer: 'observer', mail: 'sends mail', notify: 'notifies' };
+  const FXL = { 'db-read': 'reads', 'db-write': 'writes', http: 'HTTP', storage: 'storage', cache: 'cache', view: 'view', page: 'page', volt: 'Volt',
+    redirect: 'redirect to', process: 'process', artisan: 'artisan', channel: 'via' };
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const list = document.getElementById('trace-list'), main = document.getElementById('trace-main'), q = document.getElementById('trace-q');
+  let mode = 'roots', current = null;
+
+  function ref(n) {
+    if (!n[3]) return '';
+    const t = n[3] + (n[4] ? ':' + n[4] : '');
+    if (G.ed) return '<a class="ref" href="' + esc(G.ed.replace('{path}', G.root + '/' + n[3]).replace('{line}', n[4] || 1)) + '">' + esc(t) + '</a>';
+    return '<span class="ref">' + esc(t) + '</span>';
+  }
+  function chips(i) { return (fx[i] || []).map(f => '<span class="fx fx-' + esc(f[0]) + '">' + esc(FXL[f[0]] || f[0]) + ' ' + esc(f[1]) + '</span>').join(''); }
+  function row(i, e, note, rev) {
+    const n = N[i], k = e ? K[e[2]] : '', conf = e ? C[e[3]] : 'exact';
+    return (e ? '<span class="ek ek-' + k + '">' + esc(rev ? (KL[k] || k) + ' ←' : (KL[k] || k)) + '</span>' : '') +
+      '<span class="nl" style="--dot: var(--role-' + esc(n[5] || 'other') + ')">' + esc(n[2]) + '</span>' +
+      (conf !== 'exact' ? '<span class="badge ' + (conf === 'possible' ? 'warn' : 'info') + '" title="' + (conf === 'possible' ? 'One of several implementations' : 'Worked out from types or Laravel conventions') + '">' + conf + '</span>' : '') +
+      (e && e[5] ? '<span class="badge info">queued</span>' : '') + (rootOf.has(i) && rev ? '<span class="badge ok">entry point</span>' : '') +
+      (note ? '<span class="faint small">' + esc(note) + '</span>' : '') + ref(n) + (rev ? '' : chips(i)) +
+      (!rev && un[i] ? '<span class="badge" title="' + esc(un[i].map(u => u[0]).join(', ')) + '">' + un[i].length + ' not followed</span>' : '');
+  }
+  function tree(i, e, depth, path, seen, rev) {
+    const adj = rev ? inn[i] : out[i];
+    const li = document.createElement('li');
+    const leaf = (note) => { li.innerHTML = '<div class="tn leaf">' + row(i, e, note, rev) + '</div>'; return li; };
+    if (!adj.length) return leaf('');
+    if (path.has(i)) return leaf('↺ calls back into itself');
+    if (seen.has(i)) return leaf('(expanded above)');
+    seen.add(i);
+    const d = document.createElement('details'); d.className = 'tn';
+    const s = document.createElement('summary'); s.innerHTML = row(i, e, '', rev) + '<span class="count">' + adj.length + '</span>';
+    d.appendChild(s); li.appendChild(d);
+    let filled = false;
+    const fill = () => {
+      if (filled) return; filled = true;
+      const ul = document.createElement('ul'); const np = new Set(path); np.add(i);
+      adj.forEach(x => ul.appendChild(tree(rev ? x[0] : x[1], x, depth + 1, np, seen, rev)));
+      d.appendChild(ul);
+    };
+    d.addEventListener('toggle', () => { if (d.open) fill(); });
+    if (depth < (rev ? 5 : 4)) { d.open = true; fill(); }
+    return li;
+  }
+  function reach(start) {
+    const seen = new Set([start]), qu = [start];
+    while (qu.length) { const i = qu.shift(); out[i].forEach(e => { if (!seen.has(e[1]) && seen.size < 6000) { seen.add(e[1]); qu.push(e[1]); } }); }
+    return seen;
+  }
+  function summary(root) {
+    const seen = reach(root), agg = {}, jobs = new Map(), events = new Set(), sends = new Set(), unres = [];
+    let methods = 0;
+    seen.forEach(i => {
+      if (N[i][1] === 'method' || N[i][1] === 'closure') methods++;
+      (fx[i] || []).forEach(f => { const key = f[0], val = key === 'db-write' ? f[1] : f[1]; (agg[key] = agg[key] || new Set()).add(val); });
+      (un[i] || []).forEach(u => unres.push([i, u]));
+      out[i].forEach(e => { const k = K[e[2]];
+        if (k === 'dispatch') jobs.set(N[e[1]][2].replace('::handle()', '').replace('::__invoke()', ''), e[5]);
+        if (k === 'event') events.add(N[e[1]][2]);
+        if (k === 'mail' || k === 'notify') sends.add(N[e[1]][2] + (e[5] ? ' (queued)' : '')); });
+    });
+    const box = (title, items, cls) => '<div class="card"><h4>' + title + '</h4>' + (items.length ? '<div class="chips">' +
+      items.map(x => '<span class="fx ' + (cls || '') + '">' + esc(x) + '</span>').join('') + '</div>' : '<p class="faint small">none</p>') + '</div>';
+    const S = k => Array.from(agg[k] || []).sort();
+    let h = '<div class="trace-sum">' + box('Writes', S('db-write'), 'fx-db-write') + box('Reads', S('db-read'), 'fx-db-read') +
+      box('Queues jobs', Array.from(jobs).map(([j, qd]) => j + (qd ? ' (queued)' : ' (sync)'))) + box('Fires events', Array.from(events).sort()) +
+      box('Sends', Array.from(sends).sort()) + box('External calls', S('http').concat(S('storage').map(x => 'storage ' + x)).concat(S('process')), 'fx-http') +
+      box('Renders', S('page').map(x => 'page ' + x).concat(S('view').map(x => 'view ' + x)).concat(S('volt').map(x => 'Volt ' + x)).concat(S('redirect').map(x => '→ ' + x))) +
+      box('Cache', S('cache')) + '</div>';
+    h += '<p class="small muted">' + methods + ' methods reachable.' + (unres.length ? ' ' + unres.length + ' call(s) could not be followed (untyped variables): see the list under the tree.' : '') + '</p>';
+    return [h, unres];
+  }
+  function setHash(h) { try { history.replaceState(null, '', '#' + h); } catch (e) { try { location.hash = h; } catch (e2) {} } }
+  const focusMain = () => { if (window.innerWidth < 900) main.scrollIntoView({ behavior: 'smooth', block: 'start' }); };
+  function showRoot(ri) {
+    const r = G.r[ri], i = r[0];
+    current = 'x' + ri;
+    const [sum, unres] = summary(i);
+    main.innerHTML = '<div class="trace-head"><div class="crumb">' + esc(r[1]) + '</div><h2>' + esc(r[2]) + '</h2>' +
+      (r[3] ? '<p class="muted mono small">' + esc(r[3]) + '</p>' : '') + '</div>' + sum +
+      '<h3>Call tree</h3><p class="small muted">Rows open three levels deep; click to go further. Blue badges are links worked out from types or Laravel conventions rather than read directly.</p>';
+    const ul = document.createElement('ul'); ul.className = 'ttree';
+    ul.appendChild(tree(i, null, 0, new Set(), new Set(), false)); main.appendChild(ul);
+    if (unres.length) {
+      const d = document.createElement('details'); d.className = 'box';
+      d.innerHTML = '<summary>Calls that could not be followed (' + unres.length + ')</summary><div class="body"><ul>' +
+        unres.map(([n, u]) => '<li><code>' + esc(u[0]) + '</code> in <span class="mono small">' + esc(N[n][2]) + '</span> ' + ref([0, 0, 0, N[n][3], u[1]]) + '</li>').join('') +
+        '</ul><p class="small muted">Add a type hint or a <code>/** @var Foo $x */</code> comment and these become traceable.</p></div>';
+      main.appendChild(d);
+    }
+    setHash(r[4] != null ? 'r-' + r[4] : 'x-' + ri);
+    mark();
+  }
+  function entryPoints(i) {
+    const seen = new Set([i]), qu = [i], found = [];
+    while (qu.length) { const j = qu.shift(); if (rootOf.has(j) && j !== i) found.push(rootOf.get(j));
+      inn[j].forEach(e => { if (!seen.has(e[0]) && seen.size < 6000) { seen.add(e[0]); qu.push(e[0]); } }); }
+    return found;
+  }
+  function showMethod(i) {
+    current = 'm' + i;
+    const n = N[i], eps = entryPoints(i);
+    main.innerHTML = '<div class="trace-head"><div class="crumb">Who calls</div><h2>' + esc(n[2]) + '</h2>' + ref(n) + '</div>' +
+      '<div class="card"><h4>Reached from ' + eps.length + ' entry point' + (eps.length === 1 ? '' : 's') + '</h4>' +
+      (eps.length ? '<div class="entry-list">' + eps.slice(0, 80).map(ri => '<button type="button" data-ri="' + ri + '">' + esc(G.r[ri][2]) + '</button>').join('') + '</div>'
+        : '<p class="faint small">No route, command, job or component reaches this method through calls this map can see.</p>') + '</div>' +
+      '<h3>Called by</h3>';
+    if (!inn[i].length) main.insertAdjacentHTML('beforeend', '<p class="empty">No callers found. It may be unused, called from Blade or JavaScript, or called dynamically.</p>');
+    else { const ul = document.createElement('ul'); ul.className = 'ttree'; ul.appendChild(tree(i, null, 0, new Set(), new Set(), true)); main.appendChild(ul); }
+    main.querySelectorAll('[data-ri]').forEach(b => b.addEventListener('click', () => { setMode('roots'); showRoot(+b.getAttribute('data-ri')); }));
+    setHash('m-' + i);
+    mark();
+  }
+  function mark() { list.querySelectorAll('button[data-k]').forEach(b => b.setAttribute('aria-current', b.getAttribute('data-k') === current ? 'true' : 'false')); }
+  function renderList() {
+    const terms = q.value.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    const hit = s => terms.every(t => s.toLowerCase().includes(t));
+    let h = '';
+    if (mode === 'roots') {
+      const groups = new Map();
+      G.r.forEach((r, ri) => { if (hit(r[2] + ' ' + r[3] + ' ' + r[1])) { if (!groups.has(r[1])) groups.set(r[1], []); groups.get(r[1]).push(ri); } });
+      groups.forEach((ris, g) => {
+        h += '<div><h4>' + esc(g) + ' · ' + ris.length + '</h4><ul>' + ris.slice(0, 300).map(ri => '<li><button type="button" data-k="x' + ri + '" data-ri="' + ri + '">' +
+          esc(G.r[ri][2]) + (G.r[ri][3] ? '<span>' + esc(String(G.r[ri][3]).split('\\').pop()) + '</span>' : '') + '</button></li>').join('') +
+          (ris.length > 300 ? '<li class="more">+' + (ris.length - 300) + ' more: refine the filter</li>' : '') + '</ul></div>';
+      });
+    } else {
+      const ms = [];
+      N.forEach((n, i) => { if (n[1] === 'method' && inn[i].length && hit(n[2])) ms.push(i); });
+      ms.sort((a, b) => N[a][2].localeCompare(N[b][2]));
+      h += '<div><h4>Methods with callers · ' + ms.length + '</h4><ul>' + ms.slice(0, 400).map(i => '<li><button type="button" data-k="m' + i + '" data-mi="' + i + '">' +
+        esc(N[i][2]) + '<span>' + inn[i].length + ' caller' + (inn[i].length === 1 ? '' : 's') + '</span></button></li>').join('') +
+        (ms.length > 400 ? '<li class="more">+' + (ms.length - 400) + ' more: refine the filter</li>' : '') + '</ul></div>';
+    }
+    list.innerHTML = h || '<p class="empty">Nothing matches.</p>';
+    list.querySelectorAll('[data-ri]').forEach(b => b.addEventListener('click', () => { showRoot(+b.getAttribute('data-ri')); focusMain(); }));
+    list.querySelectorAll('[data-mi]').forEach(b => b.addEventListener('click', () => { showMethod(+b.getAttribute('data-mi')); focusMain(); }));
+    mark();
+  }
+  function setMode(m) {
+    mode = m;
+    document.querySelectorAll('.tt').forEach(b => b.setAttribute('aria-pressed', b.getAttribute('data-mode') === m ? 'true' : 'false'));
+    q.placeholder = m === 'roots' ? 'Filter routes, commands, jobs, components…' : 'Find a method, e.g. Order::ship';
+    renderList();
+  }
+  document.querySelectorAll('.tt').forEach(b => b.addEventListener('click', () => setMode(b.getAttribute('data-mode'))));
+  q.addEventListener('input', renderList);
+  function fromHash() {
+    const h = (location.hash || '').slice(1);
+    let m;
+    if ((m = h.match(/^r-(\d+)$/))) { const ri = G.r.findIndex(r => r[4] === +m[1]); if (ri >= 0) { showRoot(ri); return true; } }
+    if ((m = h.match(/^x-(\d+)$/)) && G.r[+m[1]]) { showRoot(+m[1]); return true; }
+    if ((m = h.match(/^m-(\d+)$/)) && N[+m[1]]) { setMode('methods'); showMethod(+m[1]); return true; }
+    return false;
+  }
+  setMode('roots');
+  if (!fromHash()) {
+    let best = 0, score = -1;
+    G.r.forEach((r, ri) => { if (r[1] !== 'Routes') return; const s = reach(r[0]).size; if (s > score) { score = s; best = ri; } });
+    if (G.r.length) showRoot(best);
+  }
+  window.addEventListener('hashchange', fromHash);
+})();
+"""
+
+
+def page_trace(data, h, pages):
+    g = data.get("calls")
+    if not g or not g["r"]:
+        return ("Request traces", "Follow what a request, command or job does.",
+                callout("info", "No entry points found", "No routes, commands or jobs with PHP handlers were found to trace."))
+    st = g["stats"]
+    total = max(1, st["exact"] + st["inferred"] + st["possible"])
+    pct = lambda n: f"{round(100 * n / total)}%"  # noqa: E731
+    intro = callout("info", f"{st['edges']} call links between {st['methods']} methods",
+                    f"{pct(st['exact'])} read directly from the code, {pct(st['inferred'])} worked out from type hints, return types or Laravel conventions "
+                    f"(events → listeners, model writes → observers, authorize() → policies), {pct(st['possible'])} “possible” (one of several implementations). "
+                    f"{st['unresolved']} call(s) on untyped variables couldn't be followed; each trace lists the ones it hits.")
+    payload = {k: v for k, v in g.items() if k not in ("pos", "unused", "routes")}
+    payload["ed"] = h.editor or ""
+    payload["root"] = h.root if h.editor else ""
+    js = json.dumps(payload, separators=(",", ":"), default=str).replace("</", "<\\/")
+    body = (intro + '<div class="trace"><aside class="trace-side" aria-label="Entry points">'
+            '<div class="trace-tabs"><button type="button" class="tt" data-mode="roots" aria-pressed="true">Entry points</button>'
+            '<button type="button" class="tt" data-mode="methods" aria-pressed="false">Who calls…</button></div>'
+            '<input type="search" id="trace-q" aria-label="Filter">'
+            '<div class="trace-list" id="trace-list"></div></aside>'
+            '<section class="trace-main" id="trace-main" aria-live="polite"><p class="muted">Pick an entry point.</p></section></div>'
+            f'<script type="application/json" id="trace-data">{js}</script>')
+    return ("Request traces", "Pick a route, command, job or Livewire component and follow every method it reaches, the tables it reads and writes, "
+                              "and what it hands to the queue. Switch to “Who calls…” to go the other way.", body)
+
+
+# =====================================================================================================
 # 27. Changes baseline, output, CLI
 # =====================================================================================================
 
@@ -8023,6 +9312,8 @@ def write_output(data, out_dir, editor):
         pages.discard("livewire.html")
     if not (data["filament"]["panels"] or data["filament"]["resources"]):
         pages.discard("filament.html")
+    if not data.get("calls"):
+        pages.discard("trace.html")
     routes = [r for r in data["routes"] if r.get("source") != "package (inferred)"]
     crit_warn = sum(1 for i in data["insights"] if i["severity"] in ("crit", "warn"))
     counts = {"routes.html": len(routes), "models.html": len(data["models"]), "database.html": len(data["schema"]),
@@ -8030,11 +9321,12 @@ def write_output(data, out_dir, editor):
               "events.html": len(data["async"]["events"]) + len(data["async"]["jobs"]) or "",
               "frontend.html": len(data["views"]) + len(data["inertia_pages"]) or "",
               "livewire.html": len(data["livewire"]["components"]), "filament.html": len(data["filament"]["resources"]),
+              "trace.html": len((data.get("calls") or {}).get("r") or []) or "",
               "classes.html": len(data["classes"]), "docker.html": len([s for s in data["docker"]["services"] if not s.get("only_in")]) or "",
               "config.html": len(data["env"]["matrix"]), "insights.html": crit_warn or "",
               "changes.html": ((data.get("changes") or {}).get("diff") or {}).get("total") or ""}
     builders = {"index.html": page_index, "start.html": page_start, "changes.html": page_changes, "routes.html": page_routes,
-                "http.html": page_http, "models.html": page_models, "database.html": page_database, "events.html": page_events,
+                "http.html": page_http, "trace.html": page_trace, "models.html": page_models, "database.html": page_database, "events.html": page_events,
                 "frontend.html": page_frontend, "livewire.html": page_livewire, "filament.html": page_filament,
                 "classes.html": page_classes, "docker.html": page_docker, "config.html": page_config, "insights.html": page_insights}
     written = []
@@ -8055,7 +9347,10 @@ def write_output(data, out_dir, editor):
             fh.write(doc)
         written.append(f)
     with open(os.path.join(out_dir, "data.json"), "w", encoding="utf-8") as fh:
-        json.dump({k: v for k, v in data.items() if k not in ("file_hashes", "_assets_local")}, fh, indent=1, default=str)
+        slim = {k: v for k, v in data.items() if k not in ("file_hashes", "_assets_local", "calls")}
+        if data.get("calls"):
+            slim["calls"] = {k: v for k, v in data["calls"].items() if k != "pos"}
+        json.dump(slim, fh, indent=1, default=str)
     return written
 
 

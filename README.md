@@ -32,6 +32,7 @@ The output folder always gets its own `.gitignore` containing `*`, so git ignore
 | **What changed** | What's different since I last looked? Commits, authors, PRs and files by area, plus a structural diff of routes, models, tables and columns, migrations, classes, env keys, composer/npm packages, Docker services and Dockerfiles, schedule and listeners. Ends with a **catch-up checklist**: pull, rebuild containers, `composer install`, `npm install`, new `.env` keys, `migrate`, `optimize:clear`, restart queue workers. |
 | **Routes** | Every route with handler, middleware, name and the file and line it's defined on. Also a URL tree, routes per controller, middleware usage and broadcast channels. Package routes (Horizon, Sanctum, Livewire…) and Filament panel routes are included. |
 | **HTTP layer** | Request-lifecycle diagram, global and group middleware and aliases, and, per controller action, what it validates, which models and services it touches, what it dispatches and what it returns. Form requests, API resources and policies too. |
+| **Request traces** | What does this request actually do? Pick a route, artisan command, scheduled task, queued job, listener or Livewire component and follow every method it reaches, including middleware, form-request validation, policies, jobs it queues (marked queued or sync), events and their listeners, and observers fired by model writes. A summary lists the tables it reads and writes, mail and notifications it sends, and external HTTP calls. **Who calls…** goes the other way: pick a method and see every caller and which routes, commands or jobs reach it. |
 | **Models** | Relationship map, and per model: table, fillable/guarded/hidden, casts, scopes, accessors, observers, policy, factory, model events and who references it. |
 | **Database** | The schema rebuilt by replaying migrations (create/alter/rename/drop, foreign keys, morphs, schema dumps). Includes an ER diagram, columns per table with a mini-diagram of each table's neighbours, and the migration history. |
 | **Events & jobs** | Who dispatches what: events → listeners (and how each is registered), jobs, mail, notifications, observers, scheduled tasks with human-readable frequencies, and artisan commands. |
@@ -41,12 +42,14 @@ The output folder always gets its own `.gitignore` containing `*`, so git ignore
 | **Classes** | Every class classified by role (model, controller, job, Livewire, Filament, action, service…), with an interactive dependency graph and the most depended-upon classes. |
 | **Docker** | Services and what each one is for, how they connect (env vars like `DB_HOST=mysql`, nginx `fastcgi_pass`, `depends_on`), ports as clickable URLs, volumes, Dockerfiles (PHP version, extensions, Xdebug), supervisor programs, `php.ini` settings. |
 | **Config & packages** | Every env var mapped to the config keys it feeds (and its default), what's missing from `.env.example` or your `.env`, config files, and every composer/npm package with a one-line explanation. |
-| **Insights** | Leads worth checking: routes pointing at missing code, Inertia pages or views that don't exist, relationships with no FK column, `env()` outside `config/`, raw SQL built from variables, `{!! !!}`, unguarded models, events without listeners, unused controllers and components, large classes and methods, `latest` image tags, change hotspots, ownership, and TODO/FIXME comments. |
+| **Insights** | Leads worth checking: routes pointing at missing code, Inertia pages or views that don't exist, relationships with no FK column, `env()` outside `config/`, raw SQL built from variables, `{!! !!}`, unguarded models, events without listeners, unused controllers and components, public methods nothing calls, large classes and methods, `latest` image tags, change hotspots, ownership, and TODO/FIXME comments. |
 | `data.json` | Everything above as JSON, for your own scripts or to paste into an LLM. |
 
 ## The three situations it is built for
 
 **New to the codebase.** Run it, read *Overview*, then follow *Getting started* top to bottom. The "Where to start reading" list and the dependency graph show which files matter.
+
+To see what one endpoint really does (tables touched, jobs queued, mail sent, external APIs hit), open **Request traces**. Every route on the Routes page has a "trace →" link.
 
 **Someone else changed things / reviewing a branch.**
 
@@ -99,6 +102,8 @@ docker run --rm -v "$PWD":/app -w /app python:3.12-slim python laravel_map.py --
 ## How it works, and its limits
 
 It reads source code. It tokenises PHP and follows the same paths Laravel does: `bootstrap/app.php` → `withRouting()` or `RouteServiceProvider` → route files → groups, prefixes, names and middleware → `Route::resource()` expansion → `require`d files. Classes are classified by parent class, interfaces, traits and namespace. Migrations are replayed in order to rebuild the schema.
+
+Request traces come from a method-level call graph. The script tracks what each variable holds: parameter and property types (including constructor injection), `new`, declared and `@return` types, `/** @var */` hints, relationships (`$order->items` → `OrderItem`), collection callbacks, and container bindings from your service providers (interface → implementation). On top of that it adds Laravel's own conventions: dispatch → job `handle()`, event → listeners, model writes → observers and `$dispatchesEvents`, `authorize()` → policy method, FormRequest → `rules()`/`authorize()`, route middleware → `handle()`. Every link is marked **exact** (read straight from the code), **inferred** (worked out from types or conventions) or **possible** (one of several implementations). Calls on untyped variables are listed as "not followed" rather than guessed. Adding a type hint or a `/** @var Foo $x */` comment makes them traceable.
 
 Things only the running app knows, such as routes registered dynamically by packages, macros, or columns added by raw SQL, can be missing or approximate. `--artisan auto` (and `--db`) close most of that gap when your containers are up. Treat *Insights* as leads to check, not verdicts.
 
